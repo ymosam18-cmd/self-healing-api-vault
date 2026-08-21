@@ -1,0 +1,181 @@
+version: '3.8'
+
+services:
+  # HashiCorp Vault - Secrets Management
+  vault:
+    image: vault:1.15.0
+    container_name: vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    volumes:
+      - vault-data:/vault/data
+      - ./vault-init.sh:/vault-init.sh
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/v1/sys/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - vault-network
+    command: server -dev
+
+  # PostgreSQL - Audit Logging Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: vault_user
+      POSTGRES_PASSWORD: vault_password
+      POSTGRES_DB: vault_audit
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault_user -d vault_audit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  # Redis - Cache Layer (Optional but recommended)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+  # Self-Healing API Vault Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: self-healing-api-vault
+    ports:
+      - "5000:5000"
+    depends_on:
+      vault:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Flask Configuration
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: 5000
+      FLASK_DEBUG: 'False'
+      FLASK_ENV: production
+
+      # Vault Configuration
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: dev-token
+      VAULT_NAMESPACE: ""
+
+      # Cache Configuration (in seconds)
+      CACHE_TTL: 3600
+      CACHE_MAX_SIZE: 1000
+
+      # Rotation Configuration (in seconds)
+      ROTATION_INTERVAL: 1800
+      GRACE_PERIOD: 600
+
+      # Services to Auto-Rotate
+      SERVICES_TO_ROTATE: "github,slack,stripe"
+
+      # Logging Configuration
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+
+      # Security Configuration
+      SECRET_KEY: dev-secret-key-change-in-production
+      JWT_SECRET: dev-jwt-secret-change-in-production
+
+      # Retry Configuration
+      MAX_RETRIES: 3
+      RETRY_BACKOFF_BASE: 2
+
+      # Vault KV Secrets Engine Path
+      VAULT_KV_PATH: secret
+
+      # Health Check Configuration
+      HEALTH_CHECK_INTERVAL: 60
+      VAULT_HEALTH_CHECK_TIMEOUT: 10
+
+      # Database Configuration
+      DATABASE_URL: postgresql://vault_user:vault_password@postgres:5432/vault_audit
+
+      # Redis Configuration (if using Redis cache instead of in-memory)
+      REDIS_URL: redis://redis:6379/0
+
+      # APScheduler Configuration
+      SCHEDULER_TIMEZONE: UTC
+      SCHEDULER_JOB_DEFAULTS_COALESCE: 'True'
+      SCHEDULER_JOB_DEFAULTS_MAX_INSTANCES: 1
+
+      # Development/Testing
+      TESTING: 'False'
+      MOCK_VAULT: 'False'
+
+    volumes:
+      - ./app.py:/app/app.py
+      - ./config.py:/app/config.py
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - vault-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Nginx - Reverse Proxy (Optional but recommended for production)
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    networks:
+      - vault-network
+    restart: unless-stopped
+
+volumes:
+  vault-data:
+  postgres-data:
+  redis-data:
+
+networks:
+  vault-network:
+    driver: bridge
